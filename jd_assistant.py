@@ -19,6 +19,7 @@ from util import (
     DEFAULT_FP,
     DEFAULT_EID,
     DEFAULT_TRACK_ID,
+    DEFAULT_TIMEOUT,
     check_login,
     deprecated,
     encrypt_pwd,
@@ -53,12 +54,14 @@ class Assistant(object):
         self.risk_control = ''
         self.eid = global_config.get('config', 'eid') or DEFAULT_EID
         self.fp = global_config.get('config', 'fp') or DEFAULT_FP
+        self.timeout = float(global_config.get('config', 'timeout') or DEFAULT_TIMEOUT)
         self.track_id = DEFAULT_TRACK_ID
 
         self.seckill_init_info = dict()
         self.seckill_order_data = dict()
         self.seckill_url = dict()
 
+        self.out_stock_update = False  # 记录循环中的商品是否下架，下架则更新数量减少查询量
         try:
             self._load_cookies()
         except Exception:
@@ -448,17 +451,20 @@ class Assistant(object):
             'Referer': 'https://item.jd.com/{}.html'.format(sku_id),
         }
         try:
-            resp = requests.get(url=url, params=payload, headers=headers, timeout=10)
+            resp = requests.get(url=url, params=payload, headers=headers, timeout=self.timeout)
         except requests.exceptions.Timeout:
-            logger.error('查询 %s 库存信息超时(10s)', sku_id)
+            logger.error('查询 %s 库存信息超时(%ss)' % (self.timeout, sku_id))
             return False
         except requests.exceptions.RequestException as e:
             raise AsstException('查询 %s 库存信息异常：%s' % (sku_id, e))
 
         resp_json = parse_json(resp.text)
         stock_state = resp_json['stock']['StockState']  # 33 -- 现货  0,34 -- 无货  36 -- '采购中'  40 -- 可配货
+        stock_price = float(resp_json['stock']['jdPrice']['p'])
+        if stock_price < 0:
+            self.out_stock_update = True
         # stock_state_name = resp_json['stock']['StockStateName']
-        return stock_state in (33, 40)
+        return stock_state in (33, 40) and stock_price >= 0
 
     @check_login
     def get_multi_item_stock(self, sku_ids, area):
@@ -499,9 +505,9 @@ class Assistant(object):
         data = json.dumps(data)
 
         try:
-            resp = self.sess.post(url=url, headers=headers, data=data, timeout=10)
+            resp = self.sess.post(url=url, headers=headers, data=data, timeout=self.timeout)
         except requests.exceptions.Timeout:
-            logger.error('查询 %s 库存信息超时(10s)', list(items_dict.keys()))
+            logger.error('查询 %s 库存信息超时(%ss)' % (self.timeout, list(items_dict.keys())))
             return False
         except requests.exceptions.RequestException as e:
             raise AsstException('查询 %s 库存信息异常：%s' % (list(items_dict.keys()), e))
@@ -1327,15 +1333,23 @@ class Assistant(object):
             logger.info('下单模式：%s 任一商品有货并且未下架均会尝试下单', items_list)
             while True:
                 for (sku_id, count) in items_dict.items():
-                    if not self.if_item_can_be_ordered(sku_ids={sku_id: count}, area=area_id):
-                        logger.info('%s 不满足下单条件，%ss后进行下一次查询', sku_id, stock_interval)
-                    else:
-                        logger.info('%s 满足下单条件，开始执行', sku_id)
-                        self._cancel_select_all_cart_item()
-                        self._add_or_change_cart_item(self.get_cart_detail(), sku_id, count)
-                        if self.submit_order_with_retry(submit_retry, submit_interval):
-                            return
-
+                    try:
+                        if count == 0:
+                            pass
+                        elif not self.if_item_can_be_ordered(sku_ids={sku_id: count}, area=area_id):
+                            logger.info('%s 不满足下单条件，%ss后进行下一次查询', sku_id, stock_interval)
+                            if self.out_stock_update:
+                                items_dict[sku_id] = 0
+                                logger.info('%s 已下架 查询: item.jd.com/%s.html' % (sku_id, sku_id))
+                                self.out_stock_update = False
+                        else:
+                            logger.info('%s 满足下单条件，开始执行', sku_id)
+                            self._cancel_select_all_cart_item()
+                            self._add_or_change_cart_item(self.get_cart_detail(), sku_id, count)
+                            if self.submit_order_with_retry(submit_retry, submit_interval):
+                                return
+                    except Exception as e:
+                        logger.error('Reason', e)
                     time.sleep(stock_interval)
         else:
             logger.info('下单模式：%s 所有都商品同时有货并且未下架才会尝试下单', items_list)
